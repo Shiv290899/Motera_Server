@@ -122,22 +122,48 @@ router.get('/image-proxy', async (req, res) => {
 })
 
 // Create invite link for staff/mechanic/callboy under an owner
-router.post('/invite', auth, requireRole([ROLES.ADMIN]), async (req, res) => {
+router.post('/invite', auth, requireRole([ROLES.ADMIN, ROLES.OWNER]), async (req, res) => {
   try {
     const body = req.body || {}
+    const actorRole = normalizeRole(req.auth?.role)
     const inviteRole = normalizeRole(body.role || ROLES.STAFF)
     const allowed = new Set([ROLES.STAFF])
     if (!allowed.has(inviteRole)) {
       return res.status(400).json({ success: false, message: 'Invalid role for invite' })
     }
-    const ownerId = String(body.ownerId || '')
-    if (!mongoose.Types.ObjectId.isValid(ownerId)) {
-      return res.status(400).json({ success: false, message: 'ownerId is required' })
+
+    let ownerId = ''
+    if (actorRole === ROLES.OWNER) {
+      ownerId = String(req.auth?.userId || '')
+    } else {
+      ownerId = String(body.ownerId || '')
+      if (!mongoose.Types.ObjectId.isValid(ownerId)) {
+        return res.status(400).json({ success: false, message: 'ownerId is required' })
+      }
     }
-    const branchId = body.branchId && mongoose.Types.ObjectId.isValid(String(body.branchId)) ? String(body.branchId) : undefined
+
+    const ownerDoc = await User.findById(ownerId).select('_id role')
+    if (!ownerDoc || normalizeRole(ownerDoc.role) !== ROLES.OWNER) {
+      return res.status(400).json({ success: false, message: 'Invalid ownerId' })
+    }
+
+    const branchIdRaw = body.branchId ? String(body.branchId) : ''
+    const branchId = mongoose.Types.ObjectId.isValid(branchIdRaw) ? branchIdRaw : undefined
+    if (branchId) {
+      const branchDoc = await Branch.findById(branchId).select('_id owner status')
+      if (!branchDoc) {
+        return res.status(400).json({ success: false, message: 'Invalid branchId' })
+      }
+      if (String(branchDoc.owner || '') !== String(ownerId)) {
+        return res.status(403).json({ success: false, message: 'Branch does not belong to owner' })
+      }
+    }
+
     const expiresIn = `${Math.max(1, INVITE_TOKEN_EXP_DAYS)}d`
     const token = jwt.sign({ type: 'invite', role: inviteRole, ownerId, ...(branchId ? { branchId } : {}) }, JWT_SECRET || 'motera', { expiresIn })
-    const inviteUrl = `${APP_URL}/register?invite=${encodeURIComponent(token)}`
+    const params = new URLSearchParams({ invite: token })
+    if (branchId) params.set('branchId', branchId)
+    const inviteUrl = `${APP_URL}/register?${params.toString()}`
     return res.json({ success: true, data: { inviteUrl, token, role: inviteRole, ownerId, branchId, expiresIn } })
   } catch (err) {
     console.error('POST /users/invite failed', err)
@@ -164,6 +190,7 @@ router.post('/register', registerRateLimitMiddleware, async (req, res) => {
     const name = String(req.body.name || '').trim()
     const email = String(req.body.email || '').trim().toLowerCase()
     const phone = req.body.phone ? String(req.body.phone).trim() : undefined
+    const inviteToken = String(req.body?.inviteToken || '').trim()
 
     if (!name || !email || !req.body.password) {
       return res.status(400).send({
@@ -172,7 +199,7 @@ router.post('/register', registerRateLimitMiddleware, async (req, res) => {
       })
     }
 
-    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'role') || Object.prototype.hasOwnProperty.call(req.body || {}, 'inviteToken')) {
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'role')) {
       return res.status(400).json({
         success: false,
         message: 'Role assignment is not allowed during signup.',
@@ -186,6 +213,53 @@ router.post('/register', registerRateLimitMiddleware, async (req, res) => {
       email,
       ...(phone ? { phone } : {}),
       role: ROLES.USER,
+    }
+
+    // Optional invite flow: attach owner + staff role safely from signed token.
+    if (inviteToken) {
+      let decoded
+      try {
+        decoded = jwt.verify(inviteToken, JWT_SECRET || 'motera')
+      } catch (_) {
+        return res.status(400).json({ success: false, message: 'Invalid or expired invite token.' })
+      }
+      if (!decoded || decoded.type !== 'invite') {
+        return res.status(400).json({ success: false, message: 'Invalid invite token.' })
+      }
+
+      const inviteOwnerId = String(decoded.ownerId || '')
+      if (!mongoose.Types.ObjectId.isValid(inviteOwnerId)) {
+        return res.status(400).json({ success: false, message: 'Invite missing owner information.' })
+      }
+
+      const ownerDoc = await User.findById(inviteOwnerId).select('_id role primaryBranch branches')
+      if (!ownerDoc || normalizeRole(ownerDoc.role) !== ROLES.OWNER) {
+        return res.status(400).json({ success: false, message: 'Invite owner not found.' })
+      }
+
+      let branchId = decoded.branchId && mongoose.Types.ObjectId.isValid(String(decoded.branchId))
+        ? String(decoded.branchId)
+        : ''
+
+      if (!branchId) {
+        branchId = String(ownerDoc.primaryBranch || (Array.isArray(ownerDoc.branches) ? ownerDoc.branches[0] : '') || '')
+      }
+      if (!branchId || !mongoose.Types.ObjectId.isValid(branchId)) {
+        return res.status(400).json({ success: false, message: 'Invite is missing a valid branch.' })
+      }
+
+      const branchDoc = await Branch.findById(branchId).select('_id owner status')
+      if (!branchDoc || String(branchDoc.owner || '') !== inviteOwnerId) {
+        return res.status(400).json({ success: false, message: 'Invite branch is invalid.' })
+      }
+      if (String(branchDoc.status || '').toLowerCase() !== 'active') {
+        return res.status(400).json({ success: false, message: 'Invite branch is inactive.' })
+      }
+
+      safeBody.role = normalizeRole(decoded.role || ROLES.STAFF)
+      safeBody.owner = inviteOwnerId
+      safeBody.primaryBranch = branchId
+      safeBody.branches = [branchId]
     }
 
     const duplicate = await User.findOne({
