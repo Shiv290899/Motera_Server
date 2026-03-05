@@ -151,7 +151,8 @@ router.post('/', auth, requireRole([ROLES.OWNER, ROLES.ADMIN]), async (req, res)
     }
     return res.status(201).send({ success: true, message: 'Branch created', data: created })
   } catch (err) {
-    if (err?.code === 11000) {
+    const dupCode = err?.code === 11000 || err?.name === 'MongoServerError' && String(err?.message || '').includes('E11000')
+    if (dupCode) {
       return res.status(409).send({ success: false, message: 'Branch code already exists' })
     }
     if (err?.name === 'ValidationError') {
@@ -162,7 +163,11 @@ router.post('/', auth, requireRole([ROLES.OWNER, ROLES.ADMIN]), async (req, res)
       return res.status(400).send({ success: false, message: `Invalid ${err?.path || 'value'}: ${err?.value}` })
     }
     console.error('POST /branches failed', err)
-    return res.status(500).send({ success: false, message: 'Failed to create branch' })
+    const details = String(err?.message || '').trim()
+    return res.status(500).send({
+      success: false,
+      message: details ? `Failed to create branch: ${details}` : 'Failed to create branch',
+    })
   }
 })
 

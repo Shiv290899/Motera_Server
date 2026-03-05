@@ -105,6 +105,20 @@ branchSchema.virtual('isService').get(function () {
 
 // ---- Small guards/normalizers ----
 branchSchema.pre('save', function (next) {
+  // If coordinates are missing/invalid, drop location entirely.
+  // This prevents 2dsphere index errors for documents with { location: { type: 'Point' } } only.
+  if (!this.location || !Array.isArray(this.location.coordinates) || this.location.coordinates.length !== 2) {
+    this.location = undefined
+    return next()
+  }
+  const [lngRaw, latRaw] = this.location.coordinates
+  const lng = Number(lngRaw)
+  const lat = Number(latRaw)
+  if (!Number.isFinite(lng) || !Number.isFinite(lat)) {
+    this.location = undefined
+    return next()
+  }
+
   // If someone accidentally provides [lat, lng], swap to [lng, lat]
   if (this.location && Array.isArray(this.location.coordinates) && this.location.coordinates.length === 2) {
     const [a, b] = this.location.coordinates
@@ -115,6 +129,7 @@ branchSchema.pre('save', function (next) {
       this.location.coordinates = [b, a]
     }
   }
+  this.location.type = 'Point'
   next()
 })
 

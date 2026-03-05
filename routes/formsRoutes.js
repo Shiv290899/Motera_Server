@@ -1,5 +1,7 @@
 const express = require('express')
 const axios = require('axios')
+const http = require('http')
+const https = require('https')
 const auth = require('../middlewares/auth')
 const requireRole = require('../middlewares/requireRole')
 const { ROLES } = require('../constants/roles')
@@ -12,6 +14,13 @@ const GOOGLE_FORM_DEFAULTS = {
   draftResponse: '[]',
   pageHistory: '0',
 }
+
+const WEBHOOK_UPSTREAM_TIMEOUT_MS = Number(process.env.WEBHOOK_UPSTREAM_TIMEOUT_MS || 15000)
+const webhookHttp = axios.create({
+  timeout: WEBHOOK_UPSTREAM_TIMEOUT_MS,
+  httpAgent: new http.Agent({ keepAlive: true, maxSockets: 100 }),
+  httpsAgent: new https.Agent({ keepAlive: true, maxSockets: 100 }),
+})
 
 function normalizeString(value) {
   if (value === null || value === undefined) return ''
@@ -304,9 +313,19 @@ const recentSerials = new Map(); // key -> timestamp
 // Lightweight cache for GET webhook proxy responses to reduce perceived latency
 // Especially useful for staff/account views that poll frequently.
 const WEBHOOK_CACHE = new Map(); // key -> { t:number, data:any }
+const WEBHOOK_INFLIGHT_GET = new Map(); // key -> Promise<any>
 const CACHE_TTL_MS = 8 * 1000; // 8s TTL (short, safe for near‑real‑time)
+function stableStringify(value) {
+  if (value === null || value === undefined) return ''
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`
+  if (typeof value === 'object') {
+    const keys = Object.keys(value).sort()
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`
+  }
+  return JSON.stringify(value)
+}
 function cacheKey(webhookUrl, payload){
-  try { return `${webhookUrl}|${JSON.stringify(payload||{})}` } catch { return String(webhookUrl||'') }
+  try { return `${webhookUrl}|${stableStringify(payload || {})}` } catch { return String(webhookUrl||'') }
 }
 function cacheGet(webhookUrl, payload){
   const k = cacheKey(webhookUrl, payload)
@@ -322,6 +341,20 @@ function cachePut(webhookUrl, payload, data){
     const arr = Array.from(WEBHOOK_CACHE.entries()).sort((a,b)=>a[1].t-b[1].t).slice(0,50)
     for (const [kk] of arr) WEBHOOK_CACHE.delete(kk)
   }
+}
+async function getOrJoinInFlightGet(webhookUrl, payload, fetcher){
+  const key = cacheKey(webhookUrl, payload)
+  const existing = WEBHOOK_INFLIGHT_GET.get(key)
+  if (existing) return existing
+  const p = (async () => {
+    const data = await fetcher()
+    cachePut(webhookUrl, payload, data)
+    return data
+  })().finally(() => {
+    WEBHOOK_INFLIGHT_GET.delete(key)
+  })
+  WEBHOOK_INFLIGHT_GET.set(key, p)
+  return p
 }
 
 function extractRowsFromWebhookData(data) {
@@ -382,6 +415,36 @@ function extractSerial(obj) {
   return null;
 }
 
+function normalizeForDedupe(value) {
+  if (Array.isArray(value)) return value.map(normalizeForDedupe)
+  if (!value || typeof value !== 'object') return value
+  const out = {}
+  const keys = Object.keys(value).sort()
+  for (const k of keys) {
+    // Ignore volatile clock fields so immediate retries stay suppressible.
+    if (
+      k === 'updatedAt' ||
+      k === 'savedAt' ||
+      k === 'timestamp' ||
+      k === 'ts' ||
+      k === '_ts'
+    ) continue
+    out[k] = normalizeForDedupe(value[k])
+  }
+  return out
+}
+
+function buildDedupeKey(payload) {
+  const serial = extractSerial(payload)
+  if (!serial) return null
+  try {
+    const norm = normalizeForDedupe(payload || {})
+    return `${String(serial).trim()}::${JSON.stringify(norm)}`
+  } catch {
+    return String(serial).trim()
+  }
+}
+
 function isDuplicateSerial(key) {
   if (!key) return false;
   const ts = recentSerials.get(key);
@@ -411,7 +474,7 @@ router.post('/booking/webhook', auth, requireRole([ROLES.STAFF, ROLES.OWNER, ROL
     const action = String(payload?.action || '').toLowerCase()
     const shouldCheckDuplicate = httpMethod !== 'GET' && (!action || action === 'save')
     if (shouldCheckDuplicate) {
-      const serialKey = extractSerial(payload)
+      const serialKey = buildDedupeKey(payload)
       if (serialKey && isDuplicateSerial(serialKey)) {
         return res.json({ success: true, duplicateSuppressed: true, message: 'Duplicate save suppressed' })
       }
@@ -430,17 +493,18 @@ router.post('/booking/webhook', auth, requireRole([ROLES.STAFF, ROLES.OWNER, ROL
       const getPage = async (pagePayload) => {
         const pageCached = cacheGet(webhookUrl, pagePayload)
         if (pageCached) return pageCached
-        const u = new URL(webhookUrl)
-        Object.entries(pagePayload || {}).forEach(([k, v]) => u.searchParams.append(k, String(v)))
-        const pageResp = await axios.get(u.toString(), config)
-        if (!String(pageResp.status).startsWith('2')) {
-          const err = new Error(`Webhook call failed with status ${pageResp.status}`)
-          err.status = pageResp.status
-          err.data = pageResp.data
-          throw err
-        }
-        cachePut(webhookUrl, pagePayload, pageResp.data)
-        return pageResp.data
+        return getOrJoinInFlightGet(webhookUrl, pagePayload, async () => {
+          const u = new URL(webhookUrl)
+          Object.entries(pagePayload || {}).forEach(([k, v]) => u.searchParams.append(k, String(v)))
+          const pageResp = await webhookHttp.get(u.toString(), config)
+          if (!String(pageResp.status).startsWith('2')) {
+            const err = new Error(`Webhook call failed with status ${pageResp.status}`)
+            err.status = pageResp.status
+            err.data = pageResp.data
+            throw err
+          }
+          return pageResp.data
+        })
       }
 
       const requestedPage = Math.max(parseInt(payload?.page || '1', 10) || 1, 1)
@@ -477,11 +541,11 @@ router.post('/booking/webhook', auth, requireRole([ROLES.STAFF, ROLES.OWNER, ROL
       cachePut(webhookUrl, payload, merged)
       return res.json({ success: true, forwarded: true, status: 200, data: merged })
     } else {
-      resp = await axios.post(webhookUrl, payload || {}, config)
+      resp = await webhookHttp.post(webhookUrl, payload || {}, config)
     }
     if (String(resp.status).startsWith('2')) {
       if (shouldCheckDuplicate) {
-        const serialKey = extractSerial(payload)
+        const serialKey = buildDedupeKey(payload)
         if (serialKey) markSerial(serialKey)
       }
       if (httpMethod === 'GET') cachePut(webhookUrl, payload, resp.data)
@@ -505,7 +569,7 @@ router.post('/jobcard/webhook', auth, requireRole([ROLES.STAFF, ROLES.OWNER, ROL
     const action = String(payload?.action || '').toLowerCase()
     const shouldCheckDuplicate = httpMethod !== 'GET' && (!action || action === 'save')
     if (shouldCheckDuplicate) {
-      const serialKey = extractSerial(payload)
+      const serialKey = buildDedupeKey(payload)
       if (serialKey && isDuplicateSerial(serialKey)) {
         return res.json({ success: true, duplicateSuppressed: true, message: 'Duplicate save suppressed' })
       }
@@ -523,17 +587,18 @@ router.post('/jobcard/webhook', auth, requireRole([ROLES.STAFF, ROLES.OWNER, ROL
       const getPage = async (pagePayload) => {
         const pageCached = cacheGet(webhookUrl, pagePayload)
         if (pageCached) return pageCached
-        const u = new URL(webhookUrl)
-        Object.entries(pagePayload || {}).forEach(([k, v]) => u.searchParams.append(k, String(v)))
-        const pageResp = await axios.get(u.toString(), config)
-        if (!String(pageResp.status).startsWith('2')) {
-          const err = new Error(`Webhook call failed with status ${pageResp.status}`)
-          err.status = pageResp.status
-          err.data = pageResp.data
-          throw err
-        }
-        cachePut(webhookUrl, pagePayload, pageResp.data)
-        return pageResp.data
+        return getOrJoinInFlightGet(webhookUrl, pagePayload, async () => {
+          const u = new URL(webhookUrl)
+          Object.entries(pagePayload || {}).forEach(([k, v]) => u.searchParams.append(k, String(v)))
+          const pageResp = await webhookHttp.get(u.toString(), config)
+          if (!String(pageResp.status).startsWith('2')) {
+            const err = new Error(`Webhook call failed with status ${pageResp.status}`)
+            err.status = pageResp.status
+            err.data = pageResp.data
+            throw err
+          }
+          return pageResp.data
+        })
       }
 
       const requestedPage = Math.max(parseInt(payload?.page || '1', 10) || 1, 1)
@@ -570,11 +635,11 @@ router.post('/jobcard/webhook', auth, requireRole([ROLES.STAFF, ROLES.OWNER, ROL
       cachePut(webhookUrl, payload, merged)
       return res.json({ success: true, forwarded: true, status: 200, data: merged })
     } else {
-      resp = await axios.post(webhookUrl, payload || {}, config)
+      resp = await webhookHttp.post(webhookUrl, payload || {}, config)
     }
     if (String(resp.status).startsWith('2')) {
       if (shouldCheckDuplicate) {
-        const serialKey = extractSerial(payload)
+        const serialKey = buildDedupeKey(payload)
         if (serialKey) markSerial(serialKey)
       }
       if (httpMethod === 'GET') cachePut(webhookUrl, payload, resp.data)

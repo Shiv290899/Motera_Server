@@ -690,13 +690,15 @@ router.post('/', auth, requireRole([ROLES.ADMIN]), async (req, res) => {
   }
 })
 
-// Admin update user (full)
-router.put('/:id', auth, requireRole([ROLES.ADMIN]), async (req, res) => {
+// Admin/Owner update user
+router.put('/:id', auth, requireRole([ROLES.ADMIN, ROLES.OWNER]), async (req, res) => {
   try {
     const id = String(req.params.id || '')
     if (!mongoose.Types.ObjectId.isValid(id)) {
       return res.status(400).json({ success: false, message: 'Invalid user id' })
     }
+    const actorRole = normalizeRole(req.auth?.role)
+    const actorUserId = String(req.auth?.userId || '')
     const body = { ...req.body }
     delete body.userId
     if (body.email) body.email = String(body.email).trim().toLowerCase()
@@ -706,19 +708,59 @@ router.put('/:id', auth, requireRole([ROLES.ADMIN]), async (req, res) => {
     if (Object.prototype.hasOwnProperty.call(body, 'role')) {
       body.role = normalizeRole(body.role)
     }
+    const targetUser = await User.findById(id).select('_id role owner')
+    if (!targetUser) return res.status(404).json({ success: false, message: 'User not found' })
+    const targetRole = normalizeRole(targetUser.role)
+    const targetOwnerId = String(targetUser.owner || '')
+
+    if (actorRole === ROLES.OWNER) {
+      // Owner can update self or users belonging to this owner only.
+      const ownsTarget = String(targetUser._id) === actorUserId || targetOwnerId === actorUserId
+      if (!ownsTarget) {
+        return res.status(403).json({ success: false, message: 'Forbidden' })
+      }
+      // Owner must not alter tenant-control fields.
+      delete body.ownerLimits
+      delete body.role
+      delete body.owner
+      // Owner cannot edit another owner record.
+      if (targetRole === ROLES.OWNER && String(targetUser._id) !== actorUserId) {
+        return res.status(403).json({ success: false, message: 'Forbidden' })
+      }
+    }
+
     if (body.role === ROLES.STAFF) {
       const ownerId = String(body.owner || '').trim()
       if (!mongoose.Types.ObjectId.isValid(ownerId)) {
         return res.status(400).json({ success: false, message: 'owner is required for STAFF' })
       }
     }
-    if (body.ownerLimits && typeof body.ownerLimits === 'object') {
+
+    if (actorRole === ROLES.ADMIN && body.ownerLimits && typeof body.ownerLimits === 'object') {
       const limitRaw = body.ownerLimits.branchLimit
       const limitNum = limitRaw === '' || limitRaw == null ? undefined : Number(limitRaw)
       body.ownerLimits = { branchLimit: Number.isFinite(limitNum) ? Math.max(0, Math.floor(limitNum)) : undefined }
       if (body.ownerLimits.branchLimit == null) delete body.ownerLimits
     } else {
       delete body.ownerLimits
+    }
+
+    // When owner sets branch mappings, ensure branches belong to this owner.
+    if (actorRole === ROLES.OWNER) {
+      const branchIds = []
+      if (body.primaryBranch && mongoose.Types.ObjectId.isValid(String(body.primaryBranch))) {
+        branchIds.push(String(body.primaryBranch))
+      }
+      if (Array.isArray(body.branches)) {
+        branchIds.push(...body.branches.map((v) => String(v)).filter((v) => mongoose.Types.ObjectId.isValid(v)))
+      }
+      const uniqBranchIds = Array.from(new Set(branchIds))
+      if (uniqBranchIds.length) {
+        const count = await Branch.countDocuments({ _id: { $in: uniqBranchIds }, owner: actorUserId })
+        if (count !== uniqBranchIds.length) {
+          return res.status(400).json({ success: false, message: 'One or more selected branches do not belong to this owner' })
+        }
+      }
     }
 
     if (body.password) {
@@ -734,7 +776,7 @@ router.put('/:id', auth, requireRole([ROLES.ADMIN]), async (req, res) => {
       { new: true, runValidators: true, allowRoleUpdate: true }
     )
     if (!updated) return res.status(404).json({ success: false, message: 'User not found' })
-    return res.json({ success: true, message: 'User updated', data: sanitizeUserForViewer(updated.toJSON(), ROLES.ADMIN) })
+    return res.json({ success: true, message: 'User updated', data: sanitizeUserForViewer(updated.toJSON(), actorRole) })
   } catch (err) {
     if (err?.code === 11000) {
       const keys = Object.keys(err.keyPattern || {})

@@ -28,10 +28,16 @@ router.get('/', auth, requireRole([ROLES.STAFF, ROLES.OWNER, ROLES.ADMIN]), asyn
 })
 
 // POST proxy (create/update/delete/admit/reject)
-router.post('/', auth, requireRole([ROLES.OWNER, ROLES.ADMIN]), async (req, res) => {
+router.post('/', auth, requireRole([ROLES.STAFF, ROLES.OWNER, ROLES.ADMIN]), async (req, res) => {
   try {
     const payload = req.body || {}
     if (!payload.action) payload.action = 'create'
+    const action = String(payload.action || '').toLowerCase()
+    const actorRole = String(req.auth?.role || '').toUpperCase()
+    // Staff can create/update movements, but owner/admin must approve/reject/admit and perform deletes.
+    if (actorRole === ROLES.STAFF && ['delete', 'admit', 'reject'].includes(action)) {
+      return res.status(403).json({ ok: false, message: 'Forbidden: only owner/admin can perform this stock action' })
+    }
     const gasUrl = payload.gasUrl || DEFAULT_GAS_URL
     delete payload.gasUrl
     const { data } = await axios.post(gasUrl, payload)
