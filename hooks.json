@@ -1,0 +1,7 @@
+[
+  {
+    "id": "deploy",
+    "execute-command": "/home/ubuntu/Motera_Server/deploy.sh",
+    "command-working-directory": "/home/ubuntu/Motera_Server"
+  }
+]
