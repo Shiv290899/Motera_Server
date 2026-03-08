@@ -18,7 +18,8 @@ const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '60d'
 const BCRYPT_SALT_ROUNDS = parseInt(process.env.BCRYPT_SALT_ROUNDS || '10', 10)
 const RESET_TOKEN_EXP_MINUTES = parseInt(process.env.RESET_TOKEN_EXP_MINUTES || '30', 10)
 const INVITE_TOKEN_EXP_DAYS = parseInt(process.env.INVITE_TOKEN_EXP_DAYS || '7', 10)
-const APP_URL = (process.env.APP_URL || 'http://localhost:5174').replace(/\/$/, '')
+const APP_URL_RAW = String(process.env.APP_URL || '').trim()
+const APP_URL = (APP_URL_RAW || 'http://localhost:5174').replace(/\/$/, '')
 if (!JWT_SECRET && process.env.NODE_ENV !== 'production') {
   console.warn('JWT_SECRET not set; using insecure default for development')
 }
@@ -62,6 +63,28 @@ function sanitizeUserForViewer(userObj, viewerRole) {
     copy.ownerConfig = sanitizeOwnerConfigForRole(copy.ownerConfig, viewerRole)
   }
   return copy
+}
+
+function resolveRequestOrigin(req) {
+  const origin = String(req?.headers?.origin || '').trim()
+  if (/^https?:\/\//i.test(origin)) return origin.replace(/\/$/, '')
+  const referer = String(req?.headers?.referer || '').trim()
+  if (/^https?:\/\//i.test(referer)) {
+    try {
+      const u = new URL(referer)
+      return `${u.protocol}//${u.host}`
+    } catch {
+      return ''
+    }
+  }
+  return ''
+}
+
+function getAppUrlForRequest(req) {
+  // Prefer explicit APP_URL from env in production.
+  if (APP_URL_RAW) return APP_URL
+  // Fallback to requesting frontend origin when APP_URL is not configured.
+  return resolveRequestOrigin(req) || APP_URL
 }
 
 const GOOGLE_IMAGE_HOST_ALLOWLIST = new Set([
@@ -163,7 +186,8 @@ router.post('/invite', auth, requireRole([ROLES.ADMIN, ROLES.OWNER]), async (req
     const token = jwt.sign({ type: 'invite', role: inviteRole, ownerId, ...(branchId ? { branchId } : {}) }, JWT_SECRET || 'motera', { expiresIn })
     const params = new URLSearchParams({ invite: token })
     if (branchId) params.set('branchId', branchId)
-    const inviteUrl = `${APP_URL}/register?${params.toString()}`
+    const appUrl = getAppUrlForRequest(req)
+    const inviteUrl = `${appUrl}/register?${params.toString()}`
     return res.json({ success: true, data: { inviteUrl, token, role: inviteRole, ownerId, branchId, expiresIn } })
   } catch (err) {
     console.error('POST /users/invite failed', err)
@@ -450,7 +474,8 @@ router.post('/forgot-password', async (req, res) => {
     user.resetPasswordExpiresAt = new Date(Date.now() + RESET_TOKEN_EXP_MINUTES * 60 * 1000)
     await user.save()
 
-    const resetLink = `${APP_URL}/login?resetToken=${rawToken}`
+    const appUrl = getAppUrlForRequest(req)
+    const resetLink = `${appUrl}/login?resetToken=${rawToken}`
 
     const responsePayload = {
       success: true,
@@ -708,7 +733,7 @@ router.put('/:id', auth, requireRole([ROLES.ADMIN, ROLES.OWNER]), async (req, re
     if (Object.prototype.hasOwnProperty.call(body, 'role')) {
       body.role = normalizeRole(body.role)
     }
-    const targetUser = await User.findById(id).select('_id role owner')
+    const targetUser = await User.findById(id).select('_id role owner ownerLimits')
     if (!targetUser) return res.status(404).json({ success: false, message: 'User not found' })
     const targetRole = normalizeRole(targetUser.role)
     const targetOwnerId = String(targetUser.owner || '')
@@ -745,7 +770,62 @@ router.put('/:id', auth, requireRole([ROLES.ADMIN, ROLES.OWNER]), async (req, re
       delete body.ownerLimits
     }
 
-    // When owner sets branch mappings, ensure branches belong to this owner.
+    // Branch assignment rules for OWNER target user.
+    // Admin can assign existing branches to an owner; owner dashboards read Branch.owner.
+    if (targetRole === ROLES.OWNER) {
+      const branchIds = []
+      if (body.primaryBranch && mongoose.Types.ObjectId.isValid(String(body.primaryBranch))) {
+        branchIds.push(String(body.primaryBranch))
+      }
+      if (Array.isArray(body.branches)) {
+        branchIds.push(
+          ...body.branches.map((v) => String(v)).filter((v) => mongoose.Types.ObjectId.isValid(v))
+        )
+      }
+      const uniqBranchIds = Array.from(new Set(branchIds))
+
+      if (uniqBranchIds.length) {
+        const existingCount = await Branch.countDocuments({ _id: { $in: uniqBranchIds } })
+        if (existingCount !== uniqBranchIds.length) {
+          return res.status(400).json({ success: false, message: 'One or more selected branches do not exist' })
+        }
+
+        const incomingLimit =
+          actorRole === ROLES.ADMIN && body.ownerLimits && typeof body.ownerLimits === 'object'
+            ? body.ownerLimits.branchLimit
+            : undefined
+        const effectiveLimitRaw =
+          incomingLimit != null ? incomingLimit : targetUser?.ownerLimits?.branchLimit
+        const effectiveLimit = Number.isFinite(Number(effectiveLimitRaw))
+          ? Math.max(0, Math.floor(Number(effectiveLimitRaw)))
+          : undefined
+        if (effectiveLimit != null && uniqBranchIds.length > effectiveLimit) {
+          return res.status(400).json({
+            success: false,
+            message: `Selected branches (${uniqBranchIds.length}) exceed owner branch limit (${effectiveLimit})`,
+          })
+        }
+
+        await Branch.updateMany(
+          { _id: { $in: uniqBranchIds } },
+          { $set: { owner: targetUser._id } }
+        )
+
+        // Keep primary branch as default for this owner.
+        if (body.primaryBranch && mongoose.Types.ObjectId.isValid(String(body.primaryBranch))) {
+          await Branch.updateMany(
+            { owner: targetUser._id },
+            { $set: { isDefault: false } }
+          )
+          await Branch.updateOne(
+            { _id: body.primaryBranch, owner: targetUser._id },
+            { $set: { isDefault: true } }
+          )
+        }
+      }
+    }
+
+    // When OWNER actor sets branch mappings, ensure branches belong to this owner.
     if (actorRole === ROLES.OWNER) {
       const branchIds = []
       if (body.primaryBranch && mongoose.Types.ObjectId.isValid(String(body.primaryBranch))) {

@@ -68,7 +68,7 @@ const corsOptions = {
 app.use(cors(corsOptions))
 
 // Explicit preflight handler (IMPORTANT for Netlify frontend)
-app.options('*', cors(corsOptions))
+app.options(/.*/, cors(corsOptions))
 
 
 // Increase body size limit to allow PDF base64 uploads from Booking form
