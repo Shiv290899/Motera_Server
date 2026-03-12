@@ -80,6 +80,18 @@ const userSchema = new Schema(
       quotationWaClosingLine: { type: String, trim: true },
       freeFittingsOptions: [{ type: String, trim: true }],
       freeFittingsDefaultSelected: [{ type: String, trim: true }],
+      labourScooterBase: [{
+        desc: { type: String, trim: true },
+        rate: { type: Number, min: 0 },
+      }],
+      labourMotorcycleBase: [{
+        desc: { type: String, trim: true },
+        rate: { type: Number, min: 0 },
+      }],
+      labourPaidAddons: [{
+        desc: { type: String, trim: true },
+        rate: { type: Number, min: 0 },
+      }],
     },
     ownerLimits: {
       branchLimit: { type: Number, min: 0 },

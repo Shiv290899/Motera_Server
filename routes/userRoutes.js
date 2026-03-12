@@ -925,6 +925,37 @@ router.patch('/me', auth, requireRole([ROLES.OWNER, ROLES.ADMIN]), async (req, r
     if (body.name) update.name = String(body.name).trim()
 
     const ownerConfig = {}
+    const normalizeLabourConfigRows = (raw) => {
+      const list = Array.isArray(raw) ? raw : []
+      const seen = new Set()
+      return list
+        .map((item) => {
+          if (!item) return null
+          if (typeof item === 'object') {
+            const desc = String(item.desc || item.name || '').trim()
+            const rateNum = Number(item.rate)
+            if (!desc) return null
+            return { desc, rate: Number.isFinite(rateNum) && rateNum >= 0 ? rateNum : 0 }
+          }
+          const text = String(item || '').trim()
+          if (!text) return null
+          const parts = text.split('|')
+          if (parts.length >= 2) {
+            const desc = String(parts[0] || '').trim()
+            const rateNum = Number(String(parts.slice(1).join('|') || '').replace(/[^\d.]/g, ''))
+            if (!desc) return null
+            return { desc, rate: Number.isFinite(rateNum) && rateNum >= 0 ? rateNum : 0 }
+          }
+          return { desc: text, rate: 0 }
+        })
+        .filter(Boolean)
+        .filter((item) => {
+          const key = String(item.desc || '').toLowerCase()
+          if (!key || seen.has(key)) return false
+          seen.add(key)
+          return true
+        })
+    }
     if (Object.prototype.hasOwnProperty.call(body, 'orgName')) {
       const v = String(body.orgName || '').trim()
       ownerConfig.orgName = v || undefined
@@ -1073,6 +1104,15 @@ router.patch('/me', auth, requireRole([ROLES.OWNER, ROLES.ADMIN]), async (req, r
       ownerConfig.freeFittingsDefaultSelected = list
         .map((x) => String(x || '').trim())
         .filter(Boolean)
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'labourScooterBase')) {
+      ownerConfig.labourScooterBase = normalizeLabourConfigRows(body.labourScooterBase)
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'labourMotorcycleBase')) {
+      ownerConfig.labourMotorcycleBase = normalizeLabourConfigRows(body.labourMotorcycleBase)
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'labourPaidAddons')) {
+      ownerConfig.labourPaidAddons = normalizeLabourConfigRows(body.labourPaidAddons)
     }
     if (Object.keys(ownerConfig).length) {
       update.ownerConfig = { ...(me.ownerConfig || {}), ...ownerConfig }
