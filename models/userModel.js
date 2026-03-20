@@ -1,5 +1,6 @@
 const mongoose = require('mongoose')
 const { ROLES, SYSTEM_ROLES, normalizeRole } = require('../constants/roles')
+const { encryptWebhookUrl } = require('../utils/webhookCrypto')
 
 const { Schema } = mongoose
 
@@ -57,6 +58,8 @@ const userSchema = new Schema(
       orgNameRegionalFontWeight: { type: Number, min: 100, max: 900 },
       orgNameFontSizePt: { type: Number, min: 8, max: 64 },
       orgNameRegionalFontSizePt: { type: Number, min: 8, max: 64 },
+      serviceInvoiceOrgNameFontSizePt: { type: Number, min: 8, max: 64 },
+      serviceInvoiceSubtitle: { type: String, trim: true },
       orgNameFontColor: { type: String, trim: true },
       orgAddress: { type: String, trim: true },
       orgAddressFontWeight: { type: Number, min: 100, max: 900 },
@@ -80,6 +83,7 @@ const userSchema = new Schema(
       quotationWaClosingLine: { type: String, trim: true },
       freeFittingsOptions: [{ type: String, trim: true }],
       freeFittingsDefaultSelected: [{ type: String, trim: true }],
+      staffTabs: [{ type: String, trim: true }],
       labourScooterBase: [{
         desc: { type: String, trim: true },
         rate: { type: Number, min: 0 },
@@ -126,8 +130,34 @@ userSchema.pre('validate', function normalizeRoleBeforeValidate(next) {
   next()
 })
 
+userSchema.pre('save', function encryptOwnerWebhookBeforeSave(next) {
+  try {
+    if (this.ownerConfig && Object.prototype.hasOwnProperty.call(this.ownerConfig, 'webhookUrl')) {
+      const encrypted = encryptWebhookUrl(this.ownerConfig.webhookUrl)
+      this.ownerConfig.webhookUrl = encrypted || undefined
+    }
+    next()
+  } catch (err) {
+    next(err)
+  }
+})
+
+function encryptWebhookUrlInUpdatePayload(update) {
+  if (!update || typeof update !== 'object') return update
+  if (update.ownerConfig && Object.prototype.hasOwnProperty.call(update.ownerConfig, 'webhookUrl')) {
+    update.ownerConfig.webhookUrl = encryptWebhookUrl(update.ownerConfig.webhookUrl) || undefined
+  }
+  if (update.$set?.ownerConfig && Object.prototype.hasOwnProperty.call(update.$set.ownerConfig, 'webhookUrl')) {
+    update.$set.ownerConfig.webhookUrl = encryptWebhookUrl(update.$set.ownerConfig.webhookUrl) || undefined
+  }
+  if (Object.prototype.hasOwnProperty.call(update.$set || {}, 'ownerConfig.webhookUrl')) {
+    update.$set['ownerConfig.webhookUrl'] = encryptWebhookUrl(update.$set['ownerConfig.webhookUrl']) || undefined
+  }
+  return update
+}
+
 function stripUnauthorizedRoleUpdate(next) {
-  const update = this.getUpdate() || {}
+  const update = encryptWebhookUrlInUpdatePayload(this.getUpdate() || {})
   const opts = this.getOptions ? this.getOptions() : {}
   const allowRoleUpdate = opts && opts.allowRoleUpdate === true
   const touchesRole =

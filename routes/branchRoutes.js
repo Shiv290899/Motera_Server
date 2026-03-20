@@ -13,6 +13,17 @@ function resolveTenantOwnerId(userDoc) {
   return userDoc?.owner ? String(userDoc.owner) : null
 }
 
+async function resolveBranchOwnerIdForCreate(userDoc) {
+  const role = normalizeRole(userDoc?.role)
+  if (role === ROLES.OWNER) return String(userDoc?._id || '')
+  if (userDoc?.owner) return String(userDoc.owner)
+  if (userDoc?.primaryBranch) {
+    const branchDoc = await Branch.findById(userDoc.primaryBranch).select('owner')
+    if (branchDoc?.owner) return String(branchDoc.owner)
+  }
+  return ''
+}
+
 // List branches with basic filters (auth)
 router.get('/', auth, requireRole([ROLES.STAFF, ROLES.OWNER, ROLES.ADMIN]), async (req, res) => {
   try {
@@ -105,7 +116,7 @@ router.get('/:id', auth, requireRole([ROLES.STAFF, ROLES.OWNER, ROLES.ADMIN]), a
 router.post('/', auth, requireRole([ROLES.OWNER, ROLES.ADMIN]), async (req, res) => {
   try {
     const body = req.body || {}
-    const me = await User.findById(req.userId).select('role ownerLimits')
+    const me = await User.findById(req.userId).select('role owner ownerLimits primaryBranch')
     const role = String(req.auth?.role || '')
     if (role === ROLES.OWNER) {
       const limit = Number.isFinite(me?.ownerLimits?.branchLimit) ? Math.max(0, Math.floor(me.ownerLimits.branchLimit)) : 1
@@ -116,6 +127,10 @@ router.post('/', auth, requireRole([ROLES.OWNER, ROLES.ADMIN]), async (req, res)
       body.owner = req.userId
       if (count === 0) body.isDefault = true
     } else if (role === ROLES.ADMIN) {
+      if (!body.owner) {
+        const inferredOwnerId = await resolveBranchOwnerIdForCreate(me)
+        if (inferredOwnerId) body.owner = inferredOwnerId
+      }
       if (!body.owner || !/^[0-9a-fA-F]{24}$/.test(String(body.owner))) {
         return res.status(400).send({ success: false, message: 'owner is required' })
       }

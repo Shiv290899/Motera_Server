@@ -18,6 +18,7 @@ const branchRoutes = require('./routes/branchRoutes')
 const stocksGasProxyRoutes = require('./routes/stocksGasProxy')
 const announcementRoutes = require('./routes/announcementRoutes')
 const cors = require('cors')
+const { hasWebhookEncryptionKey } = require('./utils/webhookCrypto')
 
 
 // CORS configuration via env
@@ -90,6 +91,10 @@ app.use('/api/announcements', announcementRoutes)
 
 
 const PORT = parseInt(process.env.PORT || '8082', 10)
+
+if (!hasWebhookEncryptionKey()) {
+  console.warn('WEBHOOK_URL_ENCRYPTION_KEY not set; owner webhook URLs will remain readable in MongoDB')
+}
 
 app.listen(PORT, () => {
   console.log(`server running on port ${PORT}`)

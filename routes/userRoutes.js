@@ -12,6 +12,7 @@ const crypto = require('crypto')
 const axios = require('axios')
 const { sendMail, isMailConfigured } = require('../utils/mailer')
 const { ROLES, normalizeRole } = require('../constants/roles')
+const { encryptWebhookUrl, serializeOwnerConfigForViewer } = require('../utils/webhookCrypto')
 
 const JWT_SECRET = process.env.JWT_SECRET
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '60d'
@@ -33,6 +34,12 @@ const registerRateLimit = createRateLimiter({
 })
 const registerRateLimitEnabled = process.env.NODE_ENV === 'production' || String(process.env.REGISTER_RATE_LIMIT_ENABLE_DEV || '').toLowerCase() === 'true'
 const registerRateLimitMiddleware = registerRateLimitEnabled ? registerRateLimit : (req, res, next) => next()
+const OWNER_CONFIG_STAFF_TABS = new Set([
+  'bookings',
+  'stock-update',
+  'stock-movements',
+  'vehiclecatalog',
+])
 
 function resolveTenantOwnerId(userDoc) {
   const role = normalizeRole(userDoc?.role)
@@ -47,12 +54,7 @@ function canViewWebhookUrls(roleInput) {
 }
 
 function sanitizeOwnerConfigForRole(ownerConfig, roleInput) {
-  if (!ownerConfig || typeof ownerConfig !== 'object') return ownerConfig
-  const clean = { ...ownerConfig }
-  if (!canViewWebhookUrls(roleInput)) {
-    delete clean.webhookUrl
-  }
-  return clean
+  return serializeOwnerConfigForViewer(ownerConfig, roleInput, canViewWebhookUrls)
 }
 
 function sanitizeUserForViewer(userObj, viewerRole) {
@@ -85,6 +87,58 @@ function getAppUrlForRequest(req) {
   if (APP_URL_RAW) return APP_URL
   // Fallback to requesting frontend origin when APP_URL is not configured.
   return resolveRequestOrigin(req) || APP_URL
+}
+
+function toValidObjectIdString(value) {
+  const raw = String(value || '').trim()
+  return mongoose.Types.ObjectId.isValid(raw) ? raw : ''
+}
+
+function mergeUniqueBranchIds(...lists) {
+  return Array.from(
+    new Set(
+      lists
+        .flat()
+        .map((value) => toValidObjectIdString(value))
+        .filter(Boolean)
+    )
+  )
+}
+
+async function syncOwnerBranchAssignments(ownerId, branchIds, primaryBranchId) {
+  const safeOwnerId = toValidObjectIdString(ownerId)
+  if (!safeOwnerId || !Array.isArray(branchIds) || !branchIds.length) return
+
+  await Branch.updateMany(
+    { _id: { $in: branchIds } },
+    { $set: { owner: safeOwnerId } }
+  )
+
+  const safePrimaryBranchId = toValidObjectIdString(primaryBranchId)
+  if (safePrimaryBranchId) {
+    await Branch.updateMany(
+      { owner: safeOwnerId },
+      { $set: { isDefault: false } }
+    )
+    await Branch.updateOne(
+      { _id: safePrimaryBranchId, owner: safeOwnerId },
+      { $set: { isDefault: true } }
+    )
+  }
+}
+
+async function healOwnerBranchAssignments(ownerDoc) {
+  const role = normalizeRole(ownerDoc?.role)
+  if (role !== ROLES.OWNER) return
+  const ownerId = toValidObjectIdString(ownerDoc?._id)
+  if (!ownerId) return
+  const primaryBranchId = toValidObjectIdString(ownerDoc?.primaryBranch?._id || ownerDoc?.primaryBranch)
+  const branchIds = mergeUniqueBranchIds(
+    primaryBranchId,
+    Array.isArray(ownerDoc?.branches) ? ownerDoc.branches.map((value) => value?._id || value) : []
+  )
+  if (!branchIds.length) return
+  await syncOwnerBranchAssignments(ownerId, branchIds, primaryBranchId)
 }
 
 const GOOGLE_IMAGE_HOST_ALLOWLIST = new Set([
@@ -376,6 +430,7 @@ router.post('/login', async (req, res) => {
       .select('-password')
       .populate('primaryBranch', 'name code owner')
       .populate({ path: 'branches', select: 'name code owner', options: { limit: 3 } })
+    await healOwnerBranchAssignments(userDoc)
     const full = userDoc ? sanitizeUserForViewer(userDoc.toJSON(), userDoc.role) : null
     let branchName = null
     let branchCode = null
@@ -673,6 +728,14 @@ router.post('/', auth, requireRole([ROLES.ADMIN]), async (req, res) => {
       return res.status(409).json({ success: false, message: sameEmail ? 'Email already exists' : samePhone ? 'Phone already exists' : 'User already exists' })
     }
 
+    const primaryBranchId = toValidObjectIdString(body.primaryBranch)
+    const explicitBranchIds = Array.isArray(body.branches)
+      ? body.branches.filter(v => mongoose.Types.ObjectId.isValid(String(v)))
+      : []
+    const ownerBranchIds = role === ROLES.OWNER
+      ? mergeUniqueBranchIds(primaryBranchId, explicitBranchIds)
+      : explicitBranchIds
+
     const payload = {
       name,
       email,
@@ -682,8 +745,8 @@ router.post('/', auth, requireRole([ROLES.ADMIN]), async (req, res) => {
       ...(body.phone ? { phone: String(body.phone).trim() } : {}),
       ...(body.jobTitle ? { jobTitle: String(body.jobTitle).trim() } : {}),
       ...(body.employeeCode ? { employeeCode: String(body.employeeCode).trim() } : {}),
-      ...(body.primaryBranch && mongoose.Types.ObjectId.isValid(String(body.primaryBranch)) ? { primaryBranch: body.primaryBranch } : {}),
-      ...(Array.isArray(body.branches) ? { branches: body.branches.filter(v => mongoose.Types.ObjectId.isValid(String(v))) } : {}),
+      ...(primaryBranchId ? { primaryBranch: primaryBranchId } : {}),
+      ...(role === ROLES.OWNER ? { branches: ownerBranchIds } : Array.isArray(body.branches) ? { branches: explicitBranchIds } : {}),
       ...(typeof body.canSwitchBranch === 'boolean' ? { canSwitchBranch: body.canSwitchBranch } : {}),
     }
 
@@ -698,6 +761,9 @@ router.post('/', auth, requireRole([ROLES.ADMIN]), async (req, res) => {
     if (normalizeRole(created.role) === ROLES.OWNER && !created.owner) {
       created.owner = created._id
       await created.save()
+    }
+    if (normalizeRole(created.role) === ROLES.OWNER && ownerBranchIds.length) {
+      await syncOwnerBranchAssignments(created._id, ownerBranchIds, primaryBranchId)
     }
     return res.status(201).json({ success: true, message: 'User created', data: sanitizeUserForViewer(created.toJSON(), ROLES.ADMIN) })
   } catch (err) {
@@ -733,7 +799,7 @@ router.put('/:id', auth, requireRole([ROLES.ADMIN, ROLES.OWNER]), async (req, re
     if (Object.prototype.hasOwnProperty.call(body, 'role')) {
       body.role = normalizeRole(body.role)
     }
-    const targetUser = await User.findById(id).select('_id role owner ownerLimits')
+    const targetUser = await User.findById(id).select('_id role owner ownerLimits primaryBranch branches')
     if (!targetUser) return res.status(404).json({ success: false, message: 'User not found' })
     const targetRole = normalizeRole(targetUser.role)
     const targetOwnerId = String(targetUser.owner || '')
@@ -773,16 +839,12 @@ router.put('/:id', auth, requireRole([ROLES.ADMIN, ROLES.OWNER]), async (req, re
     // Branch assignment rules for OWNER target user.
     // Admin can assign existing branches to an owner; owner dashboards read Branch.owner.
     if (targetRole === ROLES.OWNER) {
-      const branchIds = []
-      if (body.primaryBranch && mongoose.Types.ObjectId.isValid(String(body.primaryBranch))) {
-        branchIds.push(String(body.primaryBranch))
-      }
-      if (Array.isArray(body.branches)) {
-        branchIds.push(
-          ...body.branches.map((v) => String(v)).filter((v) => mongoose.Types.ObjectId.isValid(v))
-        )
-      }
-      const uniqBranchIds = Array.from(new Set(branchIds))
+      const nextPrimaryBranchId = toValidObjectIdString(body.primaryBranch) || toValidObjectIdString(targetUser.primaryBranch)
+      const existingBranchIds = Array.isArray(targetUser.branches) ? targetUser.branches.map((v) => String(v)) : []
+      const providedBranchIds = Array.isArray(body.branches) ? body.branches.map((v) => String(v)) : null
+      const uniqBranchIds = Array.isArray(providedBranchIds)
+        ? mergeUniqueBranchIds(nextPrimaryBranchId, providedBranchIds)
+        : mergeUniqueBranchIds(nextPrimaryBranchId, existingBranchIds)
 
       if (uniqBranchIds.length) {
         const existingCount = await Branch.countDocuments({ _id: { $in: uniqBranchIds } })
@@ -806,23 +868,11 @@ router.put('/:id', auth, requireRole([ROLES.ADMIN, ROLES.OWNER]), async (req, re
           })
         }
 
-        await Branch.updateMany(
-          { _id: { $in: uniqBranchIds } },
-          { $set: { owner: targetUser._id } }
-        )
-
-        // Keep primary branch as default for this owner.
-        if (body.primaryBranch && mongoose.Types.ObjectId.isValid(String(body.primaryBranch))) {
-          await Branch.updateMany(
-            { owner: targetUser._id },
-            { $set: { isDefault: false } }
-          )
-          await Branch.updateOne(
-            { _id: body.primaryBranch, owner: targetUser._id },
-            { $set: { isDefault: true } }
-          )
-        }
+        await syncOwnerBranchAssignments(targetUser._id, uniqBranchIds, nextPrimaryBranchId)
       }
+
+      body.branches = uniqBranchIds
+      if (nextPrimaryBranchId) body.primaryBranch = nextPrimaryBranchId
     }
 
     // When OWNER actor sets branch mappings, ensure branches belong to this owner.
@@ -992,6 +1042,15 @@ router.patch('/me', auth, requireRole([ROLES.OWNER, ROLES.ADMIN]), async (req, r
       const num = raw === '' || raw === null || raw === undefined ? undefined : Number(raw)
       ownerConfig.orgNameRegionalFontSizePt = Number.isFinite(num) ? Math.min(64, Math.max(8, num)) : undefined
     }
+    if (Object.prototype.hasOwnProperty.call(body, 'serviceInvoiceOrgNameFontSizePt')) {
+      const raw = body.serviceInvoiceOrgNameFontSizePt
+      const num = raw === '' || raw === null || raw === undefined ? undefined : Number(raw)
+      ownerConfig.serviceInvoiceOrgNameFontSizePt = Number.isFinite(num) ? Math.min(64, Math.max(8, num)) : undefined
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'serviceInvoiceSubtitle')) {
+      const v = String(body.serviceInvoiceSubtitle || '').trim()
+      ownerConfig.serviceInvoiceSubtitle = v || undefined
+    }
     if (Object.prototype.hasOwnProperty.call(body, 'orgNameFontColor')) {
       const v = String(body.orgNameFontColor || '').trim()
       ownerConfig.orgNameFontColor = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(v) ? v : undefined
@@ -1043,7 +1102,7 @@ router.patch('/me', auth, requireRole([ROLES.OWNER, ROLES.ADMIN]), async (req, r
     }
     if (Object.prototype.hasOwnProperty.call(body, 'webhookUrl') && canViewWebhookUrls(role)) {
       const v = String(body.webhookUrl || '').trim()
-      ownerConfig.webhookUrl = v || undefined
+      ownerConfig.webhookUrl = v ? encryptWebhookUrl(v) : undefined
     }
     if (Object.prototype.hasOwnProperty.call(body, 'processingFee')) {
       const raw = body.processingFee
@@ -1105,6 +1164,16 @@ router.patch('/me', auth, requireRole([ROLES.OWNER, ROLES.ADMIN]), async (req, r
         .map((x) => String(x || '').trim())
         .filter(Boolean)
     }
+    if (Object.prototype.hasOwnProperty.call(body, 'staffTabs')) {
+      const raw = body.staffTabs
+      const list = Array.isArray(raw) ? raw : []
+      ownerConfig.staffTabs = list
+        .map((x) => {
+          const rawValue = String(x || '').trim()
+          return rawValue === 'stock-update' ? 'stock-movements' : rawValue
+        })
+        .filter((item, index, arr) => item && OWNER_CONFIG_STAFF_TABS.has(item) && arr.indexOf(item) === index)
+    }
     if (Object.prototype.hasOwnProperty.call(body, 'labourScooterBase')) {
       ownerConfig.labourScooterBase = normalizeLabourConfigRows(body.labourScooterBase)
     }
@@ -1159,6 +1228,9 @@ router.get('/get-valid-user', auth, requireRole([ROLES.USER, ROLES.STAFF, ROLES.
       if (roleLc === ROLES.OWNER && !userDoc.owner) {
         await User.updateOne({ _id: userDoc._id }, { $set: { owner: userDoc._id } })
         userDoc.owner = userDoc._id
+      }
+      if (roleLc === ROLES.OWNER) {
+        await healOwnerBranchAssignments(userDoc)
       }
     } catch { /* non-blocking */ }
 
